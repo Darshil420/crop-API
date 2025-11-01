@@ -1,3 +1,4 @@
+# fastapi_predict_api.py
 from fastapi import FastAPI, HTTPException, File, UploadFile
 from pydantic import BaseModel
 from tensorflow.keras.models import load_model
@@ -8,11 +9,12 @@ import os
 import traceback
 import tempfile
 import sys
+from typing import Optional
 
 app = FastAPI(title="Prediction API")
 
-# === change this to your actual model path (raw string recommended) ===
-MODEL_PATH = r"C:\Users\DEVEL\OneDrive\Desktop\crop\model.h5"
+# Allow override via env var (set this on Render). If not set, fallback to your local path.
+MODEL_PATH = os.environ.get("MODEL_PATH", r"C:\Users\DEVEL\OneDrive\Desktop\crop\model.h5")
 
 # === CLASS NAMES (must match model output order) ===
 CLASS_NAMES = [
@@ -35,9 +37,11 @@ CLASS_NAMES = [
 
 # Load model at startup with clear logging
 model = None
-load_error = None
+load_error: Optional[str] = None
 try:
     print(f"Attempting to load model from: {MODEL_PATH}", file=sys.stderr)
+    if not os.path.exists(MODEL_PATH):
+        raise FileNotFoundError(f"Model file not found at: {MODEL_PATH}")
     model = load_model(MODEL_PATH)
     print("Model loaded successfully.", file=sys.stderr)
 except Exception as e:
@@ -48,30 +52,42 @@ except Exception as e:
 
 
 def _get_input_shape():
-    """Return (height, width, channels) expected by the model, or None."""
+    """
+    Return (height, width, channels) expected by the model, or None if unknown.
+    Handles common Keras shapes like (None, H, W, C) or (None, C, H, W) or (H, W, C).
+    """
     if model is None:
         return None
-    shape = model.input_shape
-    # typical shapes: (None, H, W, C) or (None, C, H, W) or (H, W, C)
+    shape = getattr(model, "input_shape", None)
     if not shape:
         return None
-    # Normalize to tuple
-    if len(shape) == 4:
-        # shape like (None, a, b, c) or (None, c, a, b)
+
+    # Convert to list for easier handling
+    shape = tuple(shape)
+    # Remove any leading None
+    if len(shape) == 4 and shape[0] is None:
         _, a, b, c = shape
         # Heuristic: if 'a' is 1 or 3 it's channel-first (C,H,W)
         if a in (1, 3):
             return (b, c, a)
         else:
             return (a, b, c)
+    elif len(shape) == 4:
+        # e.g. (batch, H, W, C) or (batch, C, H, W) where batch isn't None
+        _, a, b, c = shape
+        if a in (1, 3):
+            return (b, c, a)
+        else:
+            return (a, b, c)
     elif len(shape) == 3:
+        # (H, W, C)
         return shape
     else:
         return None
 
 
 def _load_and_preprocess(image_path: str):
-    """Open image, resize to model input, normalize, and return batched array."""
+    """Open image, resize to model input, normalize, and return batched array (1,H,W,C)."""
     if not os.path.exists(image_path):
         raise FileNotFoundError(f"Image not found: {image_path}")
 
@@ -79,15 +95,15 @@ def _load_and_preprocess(image_path: str):
     if target is None:
         raise RuntimeError("Unable to determine model input shape")
 
-    img = Image.open(image_path).convert("RGB")
     # target is (H, W, C)
-    img = img.resize((target[1], target[0]))
+    img = Image.open(image_path).convert("RGB")
+    img = img.resize((int(target[1]), int(target[0])))
     arr = np.array(img).astype("float32") / 255.0
 
-    # If arr is grayscale or shape mismatched handle conversions
     if arr.ndim == 2:
         arr = np.expand_dims(arr, -1)
 
+    # Adjust channels if necessary
     if arr.shape[-1] != target[2]:
         if target[2] == 1:
             img = img.convert("L")
@@ -96,9 +112,10 @@ def _load_and_preprocess(image_path: str):
             img = img.convert("RGB")
             arr = np.array(img).astype("float32") / 255.0
         else:
-            # repeat or truncate channels
+            # Repeat/truncate channels
             if arr.shape[-1] < target[2]:
-                arr = np.tile(arr, (1, 1, target[2] // arr.shape[-1] + 1))[:, :, :target[2]]
+                reps = (1, 1, (target[2] // arr.shape[-1]) + 1)
+                arr = np.tile(arr, reps)[:, :, :target[2]]
             else:
                 arr = arr[:, :, :target[2]]
 
@@ -110,12 +127,47 @@ class PredictPath(BaseModel):
     image_path: str
 
 
+@app.get("/")
+async def root():
+    return {
+        "message": "Prediction API is running",
+        "health_url": "/health",
+        "docs_url": "/docs"
+    }
+
+
 @app.get("/health")
 async def health():
     return {
         "status": "ok" if model is not None else "error",
         "model_loaded": model is not None,
         "load_error": load_error,
+    }
+
+
+def _process_predictions(preds: np.ndarray):
+    """
+    Normalize numpy predictions to python types and extract top prediction.
+    Returns dict with predicted_index, predicted_prob, predicted_class, probabilities.
+    """
+    preds = np.array(preds)
+    # If model returns shape (1, N)
+    if preds.ndim == 2 and preds.shape[0] == 1:
+        probs = preds[0]
+    else:
+        probs = preds.flatten()
+
+    # Ensure probability vector length consistent
+    probs_list = probs.tolist()
+    pred_index = int(np.argmax(probs_list))
+    pred_prob = float(np.max(probs_list))
+    pred_class = CLASS_NAMES[pred_index] if pred_index < len(CLASS_NAMES) else f"class_{pred_index}"
+
+    return {
+        "predicted_class": pred_class,
+        "predicted_index": pred_index,
+        "predicted_prob": pred_prob,
+        "probabilities": probs_list,
     }
 
 
@@ -133,26 +185,13 @@ async def predict_from_path(payload: PredictPath):
         tb = "".join(traceback.format_exception(None, e, e.__traceback__))
         raise HTTPException(status_code=500, detail=f"{str(e)}\n\nTraceback:\n{tb}")
 
-    preds = model.predict(arr)
-    # Normalize prediction to probability list
-    if isinstance(preds, list):
-        preds = np.array(preds)
-    preds = np.array(preds)
-    if preds.ndim == 2 and preds.shape[0] == 1:
-        probs = preds[0].tolist()
-    else:
-        probs = preds.flatten().tolist()
+    try:
+        preds = model.predict(arr)
+    except Exception as e:
+        tb = "".join(traceback.format_exception(None, e, e.__traceback__))
+        raise HTTPException(status_code=500, detail=f"Error during model.predict(): {str(e)}\n\nTraceback:\n{tb}")
 
-    pred_index = int(np.argmax(probs))
-    pred_prob = float(np.max(probs))
-    pred_class = CLASS_NAMES[pred_index] if pred_index < len(CLASS_NAMES) else f"class_{pred_index}"
-
-    return {
-        "predicted_class": pred_class,
-        "predicted_index": pred_index,
-        "predicted_prob": pred_prob,
-        "probabilities": probs,
-    }
+    return _process_predictions(preds)
 
 
 @app.post("/predict_upload")
@@ -171,22 +210,7 @@ async def predict_upload(file: UploadFile = File(...)):
 
         arr = _load_and_preprocess(tmp_path)
         preds = model.predict(arr)
-        preds = np.array(preds)
-        if preds.ndim == 2 and preds.shape[0] == 1:
-            probs = preds[0].tolist()
-        else:
-            probs = preds.flatten().tolist()
-
-        pred_index = int(np.argmax(probs))
-        pred_prob = float(np.max(probs))
-        pred_class = CLASS_NAMES[pred_index] if pred_index < len(CLASS_NAMES) else f"class_{pred_index}"
-
-        return {
-            "predicted_class": pred_class,
-            "predicted_index": pred_index,
-            "predicted_prob": pred_prob,
-            "probabilities": probs,
-        }
+        return _process_predictions(preds)
 
     except Exception as e:
         tb = "".join(traceback.format_exception(None, e, e.__traceback__))
@@ -202,5 +226,6 @@ async def predict_upload(file: UploadFile = File(...)):
 
 
 if __name__ == "__main__":
-    # run with: python fastapi_predict_api.py
-    uvicorn.run("fastapi_predict_api:app", host="0.0.0.0", port=8000, reload=False)
+    # When running locally: use PORT env var if provided (Render provides $PORT)
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("fastapi_predict_api:app", host="0.0.0.0", port=port, reload=False)
