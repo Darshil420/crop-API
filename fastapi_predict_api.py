@@ -183,37 +183,24 @@ def _process_predictions(preds: np.ndarray):
     }
 
 
-@app.post("/predict_from_path")
-async def predict_from_path(payload: PredictPath):
-    if model is None:
-        raise HTTPException(status_code=503, detail=f"Model not loaded: {load_error}")
-
-    try:
-        arr = _load_and_preprocess(payload.image_path)
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        tb = "".join(traceback.format_exception(None, e, e.__traceback__))
-        raise HTTPException(status_code=500, detail=f"{str(e)}\n\nTraceback:\n{tb}")
-
-    try:
-        preds = model.predict(arr)
-    except Exception as e:
-        tb = "".join(traceback.format_exception(None, e, e.__traceback__))
-        raise HTTPException(status_code=500, detail=f"Error during model.predict(): {str(e)}\n\nTraceback:\n{tb}")
-
-    return _process_predictions(preds)
-
-
 @app.post("/predict_upload")
 async def predict_upload(file: UploadFile = File(...)):
     if model is None:
         raise HTTPException(status_code=503, detail=f"Model not loaded: {load_error}")
 
+    # --- Validate file type ---
+    allowed_exts = [".jpg", ".jpeg"]
+    ext = os.path.splitext(file.filename)[1].lower()
+    if ext not in allowed_exts:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid file type: {ext}. Only .jpg or .jpeg files are allowed."
+        )
+
     tmp_path = None
     try:
         contents = await file.read()
-        suffix = os.path.splitext(file.filename)[1] or ".tmp"
+        suffix = ext or ".tmp"
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             tmp.write(contents)
             tmp_path = tmp.name
@@ -225,7 +212,10 @@ async def predict_upload(file: UploadFile = File(...)):
     except Exception as e:
         tb = "".join(traceback.format_exception(None, e, e.__traceback__))
         print("Error in /predict_upload:", tb, file=sys.stderr, flush=True)
-        raise HTTPException(status_code=500, detail=f"Exception during predict_upload: {str(e)}\n\nTraceback:\n{tb}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Exception during predict_upload: {str(e)}\n\nTraceback:\n{tb}"
+        )
 
     finally:
         try:
@@ -233,6 +223,7 @@ async def predict_upload(file: UploadFile = File(...)):
                 os.remove(tmp_path)
         except Exception:
             pass
+
 
 
 # ------------------ NEW unified endpoint /predict ------------------
