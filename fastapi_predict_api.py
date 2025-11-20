@@ -11,9 +11,44 @@ import tempfile
 import sys
 import requests  # only used if MODEL_URL is provided
 from typing import Optional
+from fastapi.middleware.cors import CORSMiddleware
 
+# ...existing code...
 app = FastAPI(title="Prediction API")
 
+# Configure CORS from environment (default allows http://127.0.0.1:5500)
+# Configure CORS from environment (default allows http://127.0.0.1:5500)
+_frontend_env = os.environ.get("FRONTEND_ORIGINS", "http://127.0.0.1:5500")
+origins = [o.strip() for o in _frontend_env.split(",") if o.strip()]
+
+# If you open index.html via file:// set ALLOW_FILE_ORIGIN=1 to allow Origin: "null"
+if os.environ.get("ALLOW_FILE_ORIGIN", "0").lower() in ("1", "true", "yes"):
+    origins.append("null")
+
+# Determine final allow_origins and whether credentials are allowed.
+# Browsers disallow Access-Control-Allow-Credentials with Access-Control-Allow-Origin: "*"
+if not origins:
+    # No origins specified -> allow any origin but disable credentials for safety
+    allow_origins = ["*"]
+    allow_credentials = False
+else:
+    allow_origins = origins
+    # If environment explicitly included "*", treat like wildcard and disable credentials
+    if any(o == "*" for o in allow_origins):
+        allow_credentials = False
+    else:
+        # When exact origins are provided, credentials may be allowed
+        allow_credentials = True
+
+print("CORS allow_origins:", allow_origins, "allow_credentials:", allow_credentials, file=sys.stderr)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allow_origins,
+    allow_credentials=allow_credentials,
+    allow_methods=["GET", "POST", "HEAD", "OPTIONS"],
+    allow_headers=["*"],
+)
 # Use env var MODEL_PATH if provided; otherwise default to local ./model.h5
 MODEL_PATH = os.environ.get("MODEL_PATH", "./model.h5")
 # Optional: set MODEL_URL to download the model at startup (direct file URL)
@@ -182,6 +217,16 @@ def _process_predictions(preds: np.ndarray):
         "probabilities": probs_list,
     }
 
+
+# ...existing code...
+@app.get("/predict")
+async def predict_get(image_path: Optional[str] = Query(None, description="Server-local image path (absolute or relative)")):
+    """
+    Convenience GET endpoint for quick browser checks.
+    Usage: /predict?image_path=C:/path/to/image.jpg
+    NOTE: This uses server's filesystem; path must be accessible to the server.
+    """
+# ...existing code...
 
 @app.post("/predict_upload")
 async def predict_upload(file: UploadFile = File(...)):
