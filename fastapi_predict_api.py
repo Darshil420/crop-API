@@ -18,7 +18,7 @@ app = FastAPI(title="Prediction API")
 
 # Configure CORS from environment (default allows http://127.0.0.1:5500)
 # Configure CORS from environment (default allows http://127.0.0.1:5500)
-_frontend_env = os.environ.get("FRONTEND_ORIGINS", "http://127.0.0.1:5500")
+_frontend_env = os.environ.get("FRONTEND_ORIGINS", "https://cropfront-dxnh.onrender.com/")
 origins = [o.strip() for o in _frontend_env.split(",") if o.strip()]
 
 # If you open index.html via file:// set ALLOW_FILE_ORIGIN=1 to allow Origin: "null"
