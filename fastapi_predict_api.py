@@ -13,32 +13,27 @@ import sys
 import requests
 from typing import Optional
 
-# Initialize App
+
 app = FastAPI(title="Prediction API")
 
-# ==========================================
-# 1. FIXED CORS SECTION (Hardcoded for Safety)
-# ==========================================
 origins = [
-    "http://127.0.0.1:5500",                  # Local VS Code Live Server
-    "http://localhost:5500",                  # Localhost alternative
-    "https://cropfront-dxnh.onrender.com"     # <--- YOUR DEPLOYED FRONTEND
+    "http://127.0.0.1:5500",                 
+    "http://localhost:5500",                  
+    "https://cropfront-dxnh.onrender.com"     
 ]
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
     allow_credentials=True,
-    allow_methods=["*"],  # Allow all methods (GET, POST, etc.)
-    allow_headers=["*"],  # Allow all headers
+    allow_methods=["*"],  
+    allow_headers=["*"],  
 )
-# ==========================================
 
-# Use env var MODEL_PATH if provided; otherwise default to local ./model.h5
 MODEL_PATH = os.environ.get("MODEL_PATH", "./model.h5")
 MODEL_URL = os.environ.get("MODEL_URL", None)
 
-# === CLASS NAMES ===
+
 CLASS_NAMES = [
     'Pepper__bell___Bacterial_spot',
     'Pepper__bell___healthy',
@@ -57,7 +52,6 @@ CLASS_NAMES = [
     'Tomato_healthy'
 ]
 
-# ===== Utility: Download model if missing =====
 def _maybe_download_model(path: str, url: Optional[str]) -> Optional[str]:
     if os.path.exists(path):
         return None
@@ -75,7 +69,7 @@ def _maybe_download_model(path: str, url: Optional[str]) -> Optional[str]:
     except Exception as e:
         return f"Failed to download model from MODEL_URL: {url} : {str(e)}"
 
-# ===== Load model at startup =====
+
 model = None
 load_error: Optional[str] = None
 
@@ -98,7 +92,7 @@ def _get_input_shape():
     shape = getattr(model, "input_shape", None)
     if not shape: return None
     shape = tuple(shape)
-    # Handle various Keras shape formats
+   
     if len(shape) == 4:
         _, a, b, c = shape
         return (b, c, a) if a in (1, 3) else (a, b, c)
@@ -188,21 +182,20 @@ async def predict_upload(file: UploadFile = File(...)):
         if tmp_path and os.path.exists(tmp_path):
             os.remove(tmp_path)
 
-# Unified Endpoint
+
 @app.post("/predict")
 async def predict(request: Request, file: UploadFile = File(None)):
-    # 1. Handle File Upload (This is what your frontend uses)
+
     if file is not None:
         return await predict_upload(file)
 
-    # 2. Handle JSON Body (Fallback)
+
     try:
         body = await request.json()
     except:
         raise HTTPException(status_code=400, detail="No file uploaded and JSON invalid.")
     
-    # Note: Ensure you have the `predict_from_path` function defined if you need this JSON feature. 
-    # Since your frontend uploads a file, the code above (predict_upload) will handle it.
+
     raise HTTPException(status_code=400, detail="JSON path prediction not fully implemented in this snippet.")
 
 if __name__ == "__main__":
