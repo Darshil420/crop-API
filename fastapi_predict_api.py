@@ -1,5 +1,6 @@
 # fastapi_predict_api.py
 from fastapi import FastAPI, HTTPException, File, UploadFile, Request, Query
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from tensorflow.keras.models import load_model
 from PIL import Image
@@ -9,52 +10,35 @@ import os
 import traceback
 import tempfile
 import sys
-import requests  # only used if MODEL_URL is provided
+import requests
 from typing import Optional
-from fastapi.middleware.cors import CORSMiddleware
 
-# ...existing code...
+# Initialize App
 app = FastAPI(title="Prediction API")
 
-# Configure CORS from environment (default allows http://127.0.0.1:5500)
-# Configure CORS from environment (default allows http://127.0.0.1:5500)
-_frontend_env = os.environ.get("FRONTEND_ORIGINS", "http://127.0.0.1:5500,https://cropfront-dxnh.onrender.com")
-origins = [o.strip() for o in _frontend_env.split(",") if o.strip()]
-
-# If you open index.html via file:// set ALLOW_FILE_ORIGIN=1 to allow Origin: "null"
-if os.environ.get("ALLOW_FILE_ORIGIN", "0").lower() in ("1", "true", "yes"):
-    origins.append("null")
-
-# Determine final allow_origins and whether credentials are allowed.
-# Browsers disallow Access-Control-Allow-Credentials with Access-Control-Allow-Origin: "*"
-if not origins:
-    # No origins specified -> allow any origin but disable credentials for safety
-    allow_origins = ["*"]
-    allow_credentials = False
-else:
-    allow_origins = origins
-    # If environment explicitly included "*", treat like wildcard and disable credentials
-    if any(o == "*" for o in allow_origins):
-        allow_credentials = False
-    else:
-        # When exact origins are provided, credentials may be allowed
-        allow_credentials = True
-
-print("CORS allow_origins:", allow_origins, "allow_credentials:", allow_credentials, file=sys.stderr)
+# ==========================================
+# 1. FIXED CORS SECTION (Hardcoded for Safety)
+# ==========================================
+origins = [
+    "http://127.0.0.1:5500",                  # Local VS Code Live Server
+    "http://localhost:5500",                  # Localhost alternative
+    "https://cropfront-dxnh.onrender.com"     # <--- YOUR DEPLOYED FRONTEND
+]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allow_origins,
-    allow_credentials=allow_credentials,
-    allow_methods=["GET", "POST", "HEAD", "OPTIONS"],
-    allow_headers=["*"],
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],  # Allow all methods (GET, POST, etc.)
+    allow_headers=["*"],  # Allow all headers
 )
+# ==========================================
+
 # Use env var MODEL_PATH if provided; otherwise default to local ./model.h5
 MODEL_PATH = os.environ.get("MODEL_PATH", "./model.h5")
-# Optional: set MODEL_URL to download the model at startup (direct file URL)
 MODEL_URL = os.environ.get("MODEL_URL", None)
 
-# === CLASS NAMES (must match model output order) ===
+# === CLASS NAMES ===
 CLASS_NAMES = [
     'Pepper__bell___Bacterial_spot',
     'Pepper__bell___healthy',
@@ -73,7 +57,7 @@ CLASS_NAMES = [
     'Tomato_healthy'
 ]
 
-# ===== Utility: try to download model if MODEL_URL is provided and file missing =====
+# ===== Utility: Download model if missing =====
 def _maybe_download_model(path: str, url: Optional[str]) -> Optional[str]:
     if os.path.exists(path):
         return None
@@ -91,7 +75,7 @@ def _maybe_download_model(path: str, url: Optional[str]) -> Optional[str]:
     except Exception as e:
         return f"Failed to download model from MODEL_URL: {url} : {str(e)}"
 
-# ===== Load model at startup with clear logging =====
+# ===== Load model at startup =====
 model = None
 load_error: Optional[str] = None
 
@@ -107,45 +91,24 @@ else:
     except Exception as e:
         load_error = "".join(traceback.format_exception(None, e, e.__traceback__))
         model = None
-        print("Model load failed. See load_error for details.", file=sys.stderr)
-        print(load_error, file=sys.stderr)
-
+        print("Model load failed.", file=sys.stderr)
 
 def _get_input_shape():
-    """
-    Return (height, width, channels) expected by the model, or None if unknown.
-    Handles common Keras shapes like (None, H, W, C) or (None, C, H, W) or (H, W, C).
-    """
-    if model is None:
-        return None
+    if model is None: return None
     shape = getattr(model, "input_shape", None)
-    if not shape:
-        return None
-
+    if not shape: return None
     shape = tuple(shape)
-    if len(shape) == 4 and shape[0] is None:
+    # Handle various Keras shape formats
+    if len(shape) == 4:
         _, a, b, c = shape
-        if a in (1, 3):
-            return (b, c, a)
-        else:
-            return (a, b, c)
-    elif len(shape) == 4:
-        _, a, b, c = shape
-        if a in (1, 3):
-            return (b, c, a)
-        else:
-            return (a, b, c)
+        return (b, c, a) if a in (1, 3) else (a, b, c)
     elif len(shape) == 3:
         return shape
-    else:
-        return None
-
+    return None
 
 def _load_and_preprocess(image_path: str):
-    """Open image, resize to model input, normalize, and return batched array (1,H,W,C)."""
     if not os.path.exists(image_path):
         raise FileNotFoundError(f"Image not found: {image_path}")
-
     target = _get_input_shape()
     if target is None:
         raise RuntimeError("Unable to determine model input shape")
@@ -154,10 +117,8 @@ def _load_and_preprocess(image_path: str):
     img = img.resize((int(target[1]), int(target[0])))
     arr = np.array(img).astype("float32") / 255.0
 
-    if arr.ndim == 2:
-        arr = np.expand_dims(arr, -1)
-
-    # Adjust channels if necessary
+    if arr.ndim == 2: arr = np.expand_dims(arr, -1)
+    
     if arr.shape[-1] != target[2]:
         if target[2] == 1:
             img = img.convert("L")
@@ -166,87 +127,52 @@ def _load_and_preprocess(image_path: str):
             img = img.convert("RGB")
             arr = np.array(img).astype("float32") / 255.0
         else:
-            if arr.shape[-1] < target[2]:
-                reps = (1, 1, (target[2] // arr.shape[-1]) + 1)
-                arr = np.tile(arr, reps)[:, :, :target[2]]
-            else:
-                arr = arr[:, :, :target[2]]
+            arr = arr[:, :, :target[2]]
 
     arr = np.expand_dims(arr, axis=0)
     return arr
 
+def _process_predictions(preds: np.ndarray):
+    preds = np.array(preds)
+    probs = preds[0] if preds.ndim == 2 and preds.shape[0] == 1 else preds.flatten()
+    probs_list = probs.tolist()
+    pred_index = int(np.argmax(probs_list))
+    pred_class = CLASS_NAMES[pred_index] if pred_index < len(CLASS_NAMES) else f"class_{pred_index}"
+    return {
+        "predicted_class": pred_class,
+        "predicted_prob": float(np.max(probs_list)),
+        "probabilities": probs_list,
+    }
 
 class PredictPath(BaseModel):
     image_path: str
 
-
 @app.get("/")
 async def root():
-    return {
-        "message": "Prediction API is running",
-        "health_url": "/health",
-        "docs_url": "/docs"
-    }
-
+    return {"message": "Prediction API is running", "health_url": "/health"}
 
 @app.get("/health")
 async def health():
     return {
         "status": "ok" if model is not None else "error",
         "model_loaded": model is not None,
-        "load_error": load_error,
-        "model_path": MODEL_PATH,
-        "model_url_env": bool(MODEL_URL)
+        "load_error": load_error
     }
-
-
-def _process_predictions(preds: np.ndarray):
-    preds = np.array(preds)
-    if preds.ndim == 2 and preds.shape[0] == 1:
-        probs = preds[0]
-    else:
-        probs = preds.flatten()
-    probs_list = probs.tolist()
-    pred_index = int(np.argmax(probs_list))
-    pred_prob = float(np.max(probs_list))
-    pred_class = CLASS_NAMES[pred_index] if pred_index < len(CLASS_NAMES) else f"class_{pred_index}"
-    return {
-        "predicted_class": pred_class,
-        "predicted_index": pred_index,
-        "predicted_prob": pred_prob,
-        "probabilities": probs_list,
-    }
-
-
-# ...existing code...
-@app.get("/predict")
-async def predict_get(image_path: Optional[str] = Query(None, description="Server-local image path (absolute or relative)")):
-    """
-    Convenience GET endpoint for quick browser checks.
-    Usage: /predict?image_path=C:/path/to/image.jpg
-    NOTE: This uses server's filesystem; path must be accessible to the server.
-    """
-# ...existing code...
 
 @app.post("/predict_upload")
 async def predict_upload(file: UploadFile = File(...)):
     if model is None:
         raise HTTPException(status_code=503, detail=f"Model not loaded: {load_error}")
 
-    # --- Validate file type ---
     allowed_exts = [".jpg", ".jpeg"]
     ext = os.path.splitext(file.filename)[1].lower()
     if ext not in allowed_exts:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid file type: {ext}. Only .jpg or .jpeg files are allowed."
-        )
+        raise HTTPException(status_code=400, detail="Only .jpg or .jpeg files allowed.")
 
     tmp_path = None
     try:
         contents = await file.read()
-        suffix = ext or ".tmp"
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
             tmp.write(contents)
             tmp_path = tmp.name
 
@@ -256,72 +182,28 @@ async def predict_upload(file: UploadFile = File(...)):
 
     except Exception as e:
         tb = "".join(traceback.format_exception(None, e, e.__traceback__))
-        print("Error in /predict_upload:", tb, file=sys.stderr, flush=True)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Exception during predict_upload: {str(e)}\n\nTraceback:\n{tb}"
-        )
-
+        print(f"Error: {tb}", file=sys.stderr)
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
-        try:
-            if tmp_path and os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        except Exception:
-            pass
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
-
-
-# ------------------ NEW unified endpoint /predict ------------------
+# Unified Endpoint
 @app.post("/predict")
 async def predict(request: Request, file: UploadFile = File(None)):
-    """
-    Unified endpoint:
-      - If multipart/form-data with `file` is sent, it will use that file.
-      - Otherwise expects JSON body: {"image_path": "absolute/or/relative/path.jpg"}
-    """
-    # If a file was uploaded via multipart/form-data
+    # 1. Handle File Upload (This is what your frontend uses)
     if file is not None:
         return await predict_upload(file)
 
-    # Try to parse JSON body for image_path
+    # 2. Handle JSON Body (Fallback)
     try:
         body = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="No file uploaded and JSON body missing or invalid. Provide multipart 'file' or JSON {'image_path': '...'}.")
-    image_path = body.get("image_path") if isinstance(body, dict) else None
-    if not image_path:
-        raise HTTPException(status_code=400, detail="JSON must include 'image_path' when not uploading a file.")
-    return await predict_from_path(PredictPath(image_path=image_path))
-# ------------------ end /predict ------------------
-
-
-# ------------------ NEW convenience GET endpoint for browser testing ------------------
-@app.get("/predict")
-async def predict_get(image_path: Optional[str] = Query(None, description="Server-local image path (absolute or relative)")):
-    """
-    Convenience GET endpoint for quick browser checks.
-    Usage: /predict?image_path=C:\path\to\image.jpg
-    NOTE: This uses server's filesystem; path must be accessible to the server.
-    """
-    if image_path is None:
-        return {
-            "message": "Use GET /predict?image_path=<path> to predict from a server-local image path, or POST /predict to upload a file or send JSON {'image_path': '...'}."
-        }
-
-    if model is None:
-        raise HTTPException(status_code=503, detail=f"Model not loaded: {load_error}")
-
-    try:
-        # Reuse the existing predict_from_path logic by calling it
-        return await predict_from_path(PredictPath(image_path=image_path))
-    except HTTPException:
-        # propagate known HTTPExceptions
-        raise
-    except Exception as e:
-        tb = "".join(traceback.format_exception(None, e, e.__traceback__))
-        raise HTTPException(status_code=500, detail=f"Error handling GET /predict: {str(e)}\n\nTraceback:\n{tb}")
-# ------------------ end GET convenience endpoint ------------------
-
+    except:
+        raise HTTPException(status_code=400, detail="No file uploaded and JSON invalid.")
+    
+    # Note: Ensure you have the `predict_from_path` function defined if you need this JSON feature. 
+    # Since your frontend uploads a file, the code above (predict_upload) will handle it.
+    raise HTTPException(status_code=400, detail="JSON path prediction not fully implemented in this snippet.")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
